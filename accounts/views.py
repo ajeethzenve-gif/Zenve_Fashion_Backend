@@ -1,4 +1,3 @@
-
 import random
 import secrets
 
@@ -17,6 +16,7 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.parsers import MultiPartParser, FormParser
 
 from rest_framework_simplejwt.tokens import RefreshToken
+from rest_framework_simplejwt.exceptions import TokenError, InvalidToken
 
 from google.oauth2 import id_token
 from google.auth.transport import requests
@@ -24,6 +24,7 @@ from google.auth.transport import requests
 
 from django.shortcuts import get_object_or_404
 from django.db import transaction
+from django.db import IntegrityError
 from .models import Customer, CustomerAddress
 from .serializers import CustomerAddressSerializer
 
@@ -40,75 +41,188 @@ from .models import (
 )
 
 
+# =========================================================
+# AUTH RESPONSE HELPER
+# =========================================================
+
+def _get_auth_user_data(user, request=None):
+    """Return the user shape expected by the frontend auth APIs."""
+    role = None
+    try:
+        role = user.user_role.role.name
+    except (UserRole.DoesNotExist, Role.DoesNotExist, AttributeError):
+        pass
+
+    phone = None
+    avatar = None
+    addresses = []
+
+    try:
+        customer = user.customer
+        phone = customer.phone_number
+
+        if customer.profile_image:
+            avatar = customer.profile_image.url
+            if request is not None:
+                avatar = request.build_absolute_uri(avatar)
+
+        addresses = CustomerAddressSerializer(
+            customer.addresses.all().order_by("-is_default", "-id"),
+            many=True
+        ).data
+    except Customer.DoesNotExist:
+        pass
+
+    name = (f"{user.first_name} {user.last_name}").strip()
+    if not name:
+        name = user.username
+
+    return {
+        "id": user.id,
+        "name": name,
+        "email": user.email,
+        "phone": phone,
+        "role": role,
+        "avatar": avatar,
+        "addresses": addresses,
+    }
+
+
 # ==========================
 # REGISTER API
 # ==========================
 
 class RegisterAPIView(APIView):
+    authentication_classes = []
+    permission_classes = [AllowAny]
 
+    @transaction.atomic
     def post(self, request):
+        # New frontend contract:
+        # {name, email, phone, password}
+        if "name" in request.data:
+            name = str(request.data.get("name", "")).strip()
+            email = str(request.data.get("email", "")).strip().lower()
+            phone = str(request.data.get("phone", "")).strip()
+            password = request.data.get("password")
 
-        serializer = RegisterSerializer(
-            data=request.data
-        )
+            if not name:
+                return Response({"message": "Name is required."}, status=status.HTTP_400_BAD_REQUEST)
+            if not email:
+                return Response({"message": "Email is required."}, status=status.HTTP_400_BAD_REQUEST)
+            if not phone:
+                return Response({"message": "Phone is required."}, status=status.HTTP_400_BAD_REQUEST)
+            if not password:
+                return Response({"message": "Password is required."}, status=status.HTTP_400_BAD_REQUEST)
+            if len(password) < 8:
+                return Response({"message": "Password must be at least 8 characters."}, status=status.HTTP_400_BAD_REQUEST)
 
+            if User.objects.filter(email__iexact=email).exists():
+                return Response({"message": "An account with this email already exists."}, status=status.HTTP_400_BAD_REQUEST)
+            if Customer.objects.filter(phone_number=phone).exists():
+                return Response({"message": "An account with this phone number already exists."}, status=status.HTTP_400_BAD_REQUEST)
 
-        if serializer.is_valid():
+            parts = name.split(None, 1)
+            first_name = parts[0]
+            last_name = parts[1] if len(parts) > 1 else ""
 
-            user = User.objects.create_user(
-                username=serializer.validated_data["username"],
-                first_name=serializer.validated_data["first_name"],
-                last_name=serializer.validated_data["last_name"],
-                email=serializer.validated_data["email"],
-                password=serializer.validated_data["password"]
-            )
+            # Keep username compatible with the existing Django authentication.
+            base_username = email.split("@")[0] or "customer"
+            username = base_username
+            counter = 1
+            while User.objects.filter(username=username).exists():
+                username = f"{base_username}{counter}"
+                counter += 1
 
-
-            # Customer Role
-            customer_role = Role.objects.get(
-                name="Customer"
-            )
-
-
-            # Assign Role
-            UserRole.objects.create(
-                user=user,
-                role=customer_role
-            )
-
-
-            # Create Customer Details
-            Customer.objects.create(
-                user=user,
-                phone_number=serializer.validated_data["phone_number"],
-                gender=serializer.validated_data.get("gender"),
-                date_of_birth=serializer.validated_data.get("date_of_birth"),
-                address=serializer.validated_data.get("address"),
-                city=serializer.validated_data.get("city"),
-                state=serializer.validated_data.get("state"),
-                country=serializer.validated_data.get(
-                    "country",
-                    "India"
-                ),
-                postal_code=serializer.validated_data.get(
-                    "postal_code"
+            try:
+                user = User.objects.create_user(
+                    username=username,
+                    first_name=first_name,
+                    last_name=last_name,
+                    email=email,
+                    password=password,
                 )
-            )
 
+                customer_role = Role.objects.get(name="Customer")
+                UserRole.objects.create(user=user, role=customer_role)
+                Customer.objects.create(
+                    user=user,
+                    phone_number=phone,
+                    country="India",
+                )
+            except Role.DoesNotExist:
+                return Response(
+                    {"message": "Customer role is not configured. Create a Customer role first."},
+                    status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                )
+            except IntegrityError:
+                return Response(
+                    {"message": "Unable to create the account. Email or phone may already exist."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            refresh = RefreshToken.for_user(user)
 
             return Response(
                 {
-                    "message":"Registration Successful"
+                    "message": "Registration Successful",
+                    "user": _get_auth_user_data(user, request),
+                    "token": str(refresh.access_token),
+                    "refreshToken": str(refresh),
+                    # Keep old keys for backward compatibility.
+                    "access": str(refresh.access_token),
+                    "refresh": str(refresh),
+                    "username": user.username,
+                    "role": "Customer",
                 },
-                status=status.HTTP_201_CREATED
+                status=status.HTTP_201_CREATED,
             )
 
+        # Existing registration contract — kept intact.
+        serializer = RegisterSerializer(data=request.data)
 
-        return Response(
-            serializer.errors,
-            status=status.HTTP_400_BAD_REQUEST
-        )
+        if serializer.is_valid():
+            try:
+                user = User.objects.create_user(
+                    username=serializer.validated_data["username"],
+                    first_name=serializer.validated_data["first_name"],
+                    last_name=serializer.validated_data["last_name"],
+                    email=serializer.validated_data["email"],
+                    password=serializer.validated_data["password"]
+                )
 
+                customer_role = Role.objects.get(name="Customer")
+
+                UserRole.objects.create(
+                    user=user,
+                    role=customer_role
+                )
+
+                Customer.objects.create(
+                    user=user,
+                    phone_number=serializer.validated_data["phone_number"],
+                    gender=serializer.validated_data.get("gender"),
+                    date_of_birth=serializer.validated_data.get("date_of_birth"),
+                    address=serializer.validated_data.get("address"),
+                    city=serializer.validated_data.get("city"),
+                    state=serializer.validated_data.get("state"),
+                    country=serializer.validated_data.get("country", "India"),
+                    postal_code=serializer.validated_data.get("postal_code")
+                )
+            except Role.DoesNotExist:
+                return Response(
+                    {"message": "Customer role is not configured. Create a Customer role first."},
+                    status=status.HTTP_500_INTERNAL_SERVER_ERROR
+                )
+            except IntegrityError:
+                return Response(
+                    {"message": "Unable to create the account. Email, username, or phone may already exist."},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+            return Response({"message": "Registration Successful"}, status=status.HTTP_201_CREATED)
+
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
 
 # ==========================
@@ -116,99 +230,190 @@ class RegisterAPIView(APIView):
 # ==========================
 
 class LoginAPIView(APIView):
-
     authentication_classes = []
-    permission_classes = []
+    permission_classes = [AllowAny]
 
     def post(self, request):
+        # Supports both the old username field and the new email/phone/OTP contract.
+        email = str(request.data.get("email", "")).strip().lower()
+        username_or_email = str(request.data.get("username", "")).strip()
+        phone = str(request.data.get("phone", "")).strip()
+        password = request.data.get("password")
+        otp = str(request.data.get("otp", "")).strip()
 
-        username_or_email = request.data.get(
-            "username"
-        )
+        user = None
 
-        password = request.data.get(
-            "password"
-        )
+        # Phone + OTP login. OTP is created by SendLoginOTPAPIView below.
+        if phone and otp and not password:
+            otp_data = cache.get(f"login_otp_{phone}")
 
+            if not otp_data:
+                return Response({"message": "OTP has expired. Please request a new OTP."}, status=status.HTTP_401_UNAUTHORIZED)
 
-        try:
+            if otp_data.get("otp") != otp:
+                return Response({"message": "Invalid OTP."}, status=status.HTTP_401_UNAUTHORIZED)
 
-            user_obj = User.objects.get(
-                email=username_or_email
-            )
+            try:
+                customer = Customer.objects.select_related("user").get(phone_number=phone)
+                user = customer.user
+            except Customer.DoesNotExist:
+                return Response({"message": "No account exists with this phone number."}, status=status.HTTP_401_UNAUTHORIZED)
 
-            username = user_obj.username
+            cache.delete(f"login_otp_{phone}")
 
+        else:
+            login_value = email or username_or_email
 
-        except User.DoesNotExist:
+            if not login_value or not password:
+                return Response({"message": "Email/username and password are required."}, status=status.HTTP_400_BAD_REQUEST)
 
-            username = username_or_email
+            try:
+                user_obj = User.objects.get(email__iexact=login_value)
+                username = user_obj.username
+            except User.DoesNotExist:
+                username = login_value
 
+            user = authenticate(username=username, password=password)
 
-
-        user = authenticate(
-            username=username,
-            password=password
-        )
-
-
-        if user is None:
-
-            return Response(
-                {
-                    "message":
-                    "Invalid Username/Email or Password"
-                },
-                status=status.HTTP_401_UNAUTHORIZED
-            )
-
+            if user is None:
+                return Response(
+                    {"message": "Invalid Username/Email or Password"},
+                    status=status.HTTP_401_UNAUTHORIZED
+                )
 
         refresh = RefreshToken.for_user(user)
 
-
-
-        # Get User Role
-
         try:
-
             role = user.user_role.role.name
-
-
-        except:
-
+        except (UserRole.DoesNotExist, AttributeError):
             role = None
 
-
+        access_token = str(refresh.access_token)
+        refresh_token = str(refresh)
 
         return Response(
             {
-                "message":"Login Successful",
-
-                "access":
-                str(refresh.access_token),
-
-                "refresh":
-                str(refresh),
-
-                "username":
-                user.username,
-
-                "email":
-                user.email,
-
-                "first_name":
-                user.first_name,
-
-                "last_name":
-                user.last_name,
-
-                "role":
-                role
+                "message": "Login Successful",
+                "user": _get_auth_user_data(user, request),
+                "token": access_token,
+                "refreshToken": refresh_token,
+                # Existing frontend compatibility.
+                "access": access_token,
+                "refresh": refresh_token,
+                "username": user.username,
+                "email": user.email,
+                "first_name": user.first_name,
+                "last_name": user.last_name,
+                "role": role,
             },
-
             status=status.HTTP_200_OK
         )
 
+
+# =========================================================
+# SEND LOGIN OTP
+# =========================================================
+
+class SendLoginOTPAPIView(APIView):
+    authentication_classes = []
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        phone = str(request.data.get("phone", "")).strip()
+
+        if not phone:
+            return Response({"message": "Phone is required."}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            customer = Customer.objects.select_related("user").get(phone_number=phone)
+        except Customer.DoesNotExist:
+            return Response({"message": "No account exists with this phone number."}, status=status.HTTP_404_NOT_FOUND)
+
+        otp = str(random.randint(100000, 999999))
+        cache.set(
+            f"login_otp_{phone}",
+            {"otp": otp, "user_id": customer.user_id},
+            timeout=300
+        )
+
+        # Your existing project has email sending configured. Without an SMS provider,
+        # send the OTP to the customer's registered email instead of pretending to send SMS.
+        try:
+            send_mail(
+                subject="PetCare Store - Login OTP",
+                message=(
+                    f"Hello {customer.user.first_name or customer.user.username},\n\n"
+                    f"Your login OTP is: {otp}\n\n"
+                    "This OTP is valid for 5 minutes.\n\n"
+                    "Regards,\nPetCare Store"
+                ),
+                from_email=None,
+                recipient_list=[customer.user.email],
+                fail_silently=False,
+            )
+        except Exception:
+            cache.delete(f"login_otp_{phone}")
+            return Response(
+                {"message": "Unable to send OTP."},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
+        return Response(
+            {"message": "OTP sent successfully.", "phone": phone},
+            status=status.HTTP_200_OK
+        )
+
+
+# =========================================================
+# AUTH ME API
+# =========================================================
+
+class AuthMeAPIView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        return Response(_get_auth_user_data(request.user, request), status=status.HTTP_200_OK)
+
+
+# =========================================================
+# REFRESH TOKEN API
+# =========================================================
+
+class AuthRefreshTokenAPIView(APIView):
+    authentication_classes = []
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        token = request.data.get("token") or request.data.get("refreshToken")
+
+        if not token:
+            return Response({"message": "Refresh token is required."}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            refresh = RefreshToken(token)
+            return Response({"token": str(refresh.access_token)}, status=status.HTTP_200_OK)
+        except TokenError:
+            return Response({"message": "Invalid or expired refresh token."}, status=status.HTTP_401_UNAUTHORIZED)
+
+
+# =========================================================
+# LOGOUT API
+# =========================================================
+
+class AuthLogoutAPIView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        # Blacklist the supplied refresh token when available.
+        refresh_token = request.data.get("refreshToken") or request.data.get("refresh")
+
+        if refresh_token:
+            try:
+                RefreshToken(refresh_token).blacklist()
+            except (TokenError, AttributeError):
+                pass
+
+        return Response({"message": "Logout Successful"}, status=status.HTTP_200_OK)
 
 
 # ==========================
@@ -997,83 +1202,6 @@ class ForgotPasswordAPIView(APIView):
         )
 
         # =====================================================
-        # SEND EMAIL
-        # =====================================================
-
-        try:
-
-            send_mail(
-
-                subject=
-                "PetCare Store - Password Reset OTP",
-
-                message=f"""
-Hello {user.first_name or user.username},
-
-We received a request to reset your PetCare Store password.
-
-Your OTP is:
-
-{otp}
-
-This OTP is valid for 5 minutes.
-
-If you did not request a password reset, please ignore this email.
-
-Regards,
-PetCare Store
-""",
-
-                from_email=None,
-
-                recipient_list=[
-                    email
-                ],
-
-                fail_silently=False
-            )
-
-        except Exception as e:
-
-            print(
-                "PASSWORD RESET EMAIL ERROR:",
-                str(e)
-            )
-
-            # Delete cache if email failed
-
-            cache.delete(
-                cache_key
-            )
-
-            return Response(
-                {
-                    "detail":
-                    "Unable to send OTP email."
-                },
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR
-            )
-
-        # =====================================================
-        # SUCCESS
-        # =====================================================
-
-        return Response(
-            {
-                "message":
-                "OTP sent successfully.",
-
-                "email":
-                email,
-
-                "reset_token":
-                reset_token
-            },
-            status=status.HTTP_200_OK
-        )
-# =========================================================
-# VERIFY OTP
-# =========================================================
 
 class VerifyPasswordOTPAPIView(APIView):
 

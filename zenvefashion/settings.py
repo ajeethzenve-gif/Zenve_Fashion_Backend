@@ -10,45 +10,36 @@ import os
 
 from dotenv import load_dotenv
 
-
 # =====================================================
 # BASE DIRECTORY
 # =====================================================
-
 BASE_DIR = Path(__file__).resolve().parent.parent
-
 
 # =====================================================
 # LOAD ENVIRONMENT VARIABLES
 # =====================================================
-
 ENV_FILE = BASE_DIR / ".env"
-
 load_dotenv(ENV_FILE, override=True)
-
 
 # =====================================================
 # SECURITY
 # =====================================================
-
 SECRET_KEY = os.getenv("SECRET_KEY", "django-insecure-development-key-change-in-production")
-
-DEBUG = os.getenv("DEBUG", "False").lower() == "true"
-
+DEBUG = os.getenv("DEBUG", "True").lower() == "true"
 
 ALLOWED_HOSTS = [
     host.strip()
-    for host in os.getenv("ALLOWED_HOSTS", "").split(",")
+    for host in os.getenv(
+        "ALLOWED_HOSTS",
+        "127.0.0.1,localhost"
+    ).split(",")
     if host.strip()
 ]
-
 
 # =====================================================
 # APPLICATIONS
 # =====================================================
-
 INSTALLED_APPS = [
-
     # Django
     "django.contrib.admin",
     "django.contrib.auth",
@@ -75,8 +66,8 @@ INSTALLED_APPS = [
     "accounts",
     "products",
     "designers",
+    'orders'
 ]
-
 
 # =====================================================
 # MIDDLEWARE
@@ -351,38 +342,24 @@ GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
 # =====================================================
 # EMAIL CONFIGURATION
 # =====================================================
-
 EMAIL_BACKEND = "django.core.mail.backends.smtp.EmailBackend"
-
 EMAIL_HOST = "smtp.gmail.com"
-
 EMAIL_PORT = 587
-
 EMAIL_USE_TLS = True
-
 EMAIL_HOST_USER = os.getenv("EMAIL_HOST_USER")
-
 EMAIL_HOST_PASSWORD = os.getenv("EMAIL_HOST_PASSWORD")
-
 DEFAULT_FROM_EMAIL = EMAIL_HOST_USER
-
-
 # =====================================================
 # RAZORPAY
 # =====================================================
-
 RAZORPAY_KEY_ID = os.getenv("RAZORPAY_KEY_ID")
-
 RAZORPAY_KEY_SECRET = os.getenv("RAZORPAY_KEY_SECRET")
-
-
 # =====================================================
 # LOGIN / LOGOUT
 # =====================================================
 SILENCED_SYSTEM_CHECKS = [
     "models.W036",
 ]
-
 LOGIN_REDIRECT_URL = "/"
-
 LOGOUT_REDIRECT_URL = "/"
+
